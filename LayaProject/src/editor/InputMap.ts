@@ -1,0 +1,284 @@
+/**
+ * Godot `InputMap` 单例的移植。
+ *
+ * 负责「动作（action）」与「输入事件（InputEvent）」之间的绑定关系，
+ * 以及每个动作的死区（deadzone）。
+ *
+ * 本文件不依赖 Laya 运行时，编辑器扩展可以安全引入。
+ */
+
+import { ActionMatchResult, InputEvent, InputEventAction } from "./InputEvent";
+
+/** 一个动作的绑定数据。 */
+export interface InputMapAction {
+  /** 动作名。 */
+  name: string;
+  /** 死区，取值 0 ~ 1。 */
+  deadzone: number;
+  /** 绑定的事件列表。 */
+  events: InputEvent[];
+}
+
+/** 默认死区，与 Godot 一致。 */
+export const DEFAULT_DEADZONE = 0.2;
+
+/** 动作匹配的结果，等价于 Godot 的 `InputMap.event_get_action_status()` 返回值。 */
+export interface ActionStatus {
+  /** 是否命中该动作。 */
+  active: boolean;
+  /** 是否处于按下状态。 */
+  pressed: boolean;
+  /** 归一化后的强度。 */
+  strength: number;
+  /** 原始强度。 */
+  rawStrength: number;
+}
+
+/** 把原始强度按死区归一化，等价于 Godot 的强度换算。 */
+export function normalizeStrength(rawStrength: number, deadzone: number): number {
+  if (rawStrength <= 0) return 0;
+  if (rawStrength < deadzone) return 0;
+  if (deadzone >= 1) return 0;
+  return (rawStrength - deadzone) / (1 - deadzone);
+}
+
+/** 输入映射表。等价于 Godot 的 `InputMap` 单例（autoload）。 */
+export class InputMap {
+  private static _singleton: InputMap | null = null;
+
+  private _actions: Map<string, InputMapAction> = new Map();
+  /** 由代码强制设置的动作状态（`Input.actionPress` / `Input.setAxis`）。 */
+  private _forced: Map<string, { pressed: boolean; strength: number }> = new Map();
+
+  /** 获取单例。等价于 Godot 的 `InputMap.get_singleton()`。 */
+  static get singleton(): InputMap {
+    if (!InputMap._singleton) InputMap._singleton = new InputMap();
+    return InputMap._singleton;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*                        动作（Action）管理                          */
+  /* ------------------------------------------------------------------ */
+
+  /** 是否存在该动作。 */
+  hasAction(action: string): boolean {
+    return this._actions.has(action);
+  }
+
+  /** 返回所有动作名。等价于 `InputMap.get_actions()`。 */
+  getActions(): string[] {
+    return Array.from(this._actions.keys());
+  }
+
+  /**
+   * 新增一个动作。等价于 `InputMap.add_action(action, deadzone)`。
+   * 若已存在则只更新死区。
+   */
+  addAction(action: string, deadzone: number = DEFAULT_DEADZONE): void {
+    if (!action) return;
+    const existing = this._actions.get(action);
+    if (existing) {
+      existing.deadzone = deadzone;
+      return;
+    }
+    this._actions.set(action, { name: action, deadzone, events: [] });
+  }
+
+  /** 删除动作。等价于 `InputMap.erase_action()`。 */
+  eraseAction(action: string): void {
+    this._actions.delete(action);
+    this._forced.delete(action);
+  }
+
+  /** 重命名动作，同时保留原有绑定。 */
+  renameAction(action: string, newName: string): boolean {
+    const data = this._actions.get(action);
+    if (!data || !newName || this._actions.has(newName)) return false;
+    this._actions.delete(action);
+    data.name = newName;
+    this._actions.set(newName, data);
+    return true;
+  }
+
+  /** 删除全部动作。 */
+  clear(): void {
+    this._actions.clear();
+    this._forced.clear();
+  }
+
+  /** 设置动作死区。等价于 `InputMap.action_set_deadzone()`。 */
+  actionSetDeadzone(action: string, deadzone: number): void {
+    const data = this._actions.get(action);
+    if (data) data.deadzone = deadzone;
+  }
+
+  /** 读取动作死区。等价于 `InputMap.action_get_deadzone()`。 */
+  actionGetDeadzone(action: string): number {
+    const data = this._actions.get(action);
+    return data ? data.deadzone : DEFAULT_DEADZONE;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*                        事件（Event）绑定                           */
+  /* ------------------------------------------------------------------ */
+
+  /** 给动作添加一个绑定事件。等价于 `InputMap.action_add_event()`。 */
+  actionAddEvent(action: string, event: InputEvent): void {
+    if (!this.hasAction(action)) this.addAction(action);
+    this._actions.get(action)!.events.push(event);
+  }
+
+  /** 动作是否已绑定该事件（全字段比较）。等价于 `InputMap.action_has_event()`。 */
+  actionHasEvent(action: string, event: InputEvent): boolean {
+    const data = this._actions.get(action);
+    if (!data) return false;
+    return data.events.some((e) => e.isMatch(event));
+  }
+
+  /** 移除动作上的指定绑定事件。等价于 `InputMap.action_erase_event()`。 */
+  actionEraseEvent(action: string, event: InputEvent): void {
+    const data = this._actions.get(action);
+    if (!data) return;
+    const index = data.events.findIndex((e) => e.isMatch(event));
+    if (index >= 0) data.events.splice(index, 1);
+  }
+
+  /** 移除动作上的全部绑定事件。等价于 `InputMap.action_erase_events()`。 */
+  actionEraseEvents(action: string): void {
+    const data = this._actions.get(action);
+    if (data) data.events.length = 0;
+  }
+
+  /** 读取动作绑定的全部事件。等价于 `InputMap.action_get_events()`。 */
+  actionGetEvents(action: string): InputEvent[] {
+    const data = this._actions.get(action);
+    return data ? data.events.slice() : [];
+  }
+
+  /**
+   * 判断一个输入事件是否触发指定动作。
+   * 等价于 `InputMap.event_is_action()`。
+   */
+  eventIsAction(event: InputEvent, action: string, exactMatch: boolean = false): boolean {
+    return this.eventGetActionStatus(event, action, exactMatch).active;
+  }
+
+  /**
+   * 获取事件的完整动作状态。
+   * 等价于 `InputMap.event_get_action_status()`。
+   */
+  eventGetActionStatus(event: InputEvent, action: string, exactMatch: boolean = false): ActionStatus {
+    const empty: ActionStatus = { active: false, pressed: false, strength: 0, rawStrength: 0 };
+    if (!event || !action) return empty;
+    const data = this._actions.get(action);
+    if (!data) return empty;
+
+    // 1) InputEventAction 直接命中动作名。
+    if (event instanceof InputEventAction) {
+      if (event.action !== action) return empty;
+      const strength = event.strength === 0 ? 1 : event.strength;
+      return {
+        active: true,
+        pressed: event.isPressed(),
+        strength: Math.min(Math.max(strength, 0), 1),
+        rawStrength: strength,
+      };
+    }
+
+    // 2) 依次尝试动作上绑定的每个事件。
+    let pressed = false;
+    let rawStrength = 0;
+    const out: ActionMatchResult = { pressed: false, strength: 0 };
+    for (const rule of data.events) {
+      out.pressed = false;
+      out.strength = 0;
+      if (!rule.actionMatch(event, out, data.deadzone, exactMatch)) continue;
+      if (exactMatch && !rule.isMatch(event)) continue;
+      pressed = pressed || out.pressed;
+      rawStrength = Math.max(rawStrength, out.strength);
+    }
+    if (!pressed && rawStrength === 0) return empty;
+
+    return {
+      active: true,
+      pressed,
+      strength: normalizeStrength(rawStrength, data.deadzone),
+      rawStrength,
+    };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*                          强制动作状态                              */
+  /* ------------------------------------------------------------------ */
+
+  /** 由 `Input.actionPress()` 写入。 */
+  setForcedAction(action: string, pressed: boolean, strength: number = 1): void {
+    if (!this.hasAction(action)) this.addAction(action);
+    this._forced.set(action, { pressed, strength: pressed ? strength : 0 });
+  }
+
+  /** 读取强制动作状态，不存在时返回 null。 */
+  getForcedAction(action: string): { pressed: boolean; strength: number } | null {
+    const value = this._forced.get(action);
+    return value ? { pressed: value.pressed, strength: value.strength } : null;
+  }
+
+  /** 清空所有强制状态（抬起全部虚拟动作）。 */
+  clearForcedActions(): void {
+    this._forced.clear();
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*                           序列化                                   */
+  /* ------------------------------------------------------------------ */
+
+  /** 导出为纯数据对象；编辑器扩展写入的 JSON 就是这个结构。 */
+  toJSON(): any {
+    const actions: any[] = [];
+    for (const data of this._actions.values()) {
+      actions.push({
+        name: data.name,
+        deadzone: data.deadzone,
+        events: data.events.map((e) => e.toJSON()),
+      });
+    }
+    return { version: 1, actions };
+  }
+
+  /**
+   * 从纯数据对象载入。对应 Godot 的 `InputMap.load_from_project_settings()`，
+   * 数据格式由本项目自定义（见 `toJSON`）。
+   */
+  loadFromJSON(data: any): void {
+    this.clear();
+    if (!data) return;
+    const actions = Array.isArray(data) ? data : data.actions;
+    if (!Array.isArray(actions)) return;
+    for (const raw of actions) {
+      if (!raw || !raw.name) continue;
+      this.addAction(raw.name, typeof raw.deadzone === "number" ? raw.deadzone : DEFAULT_DEADZONE);
+      const rawEvents = Array.isArray(raw.events) ? raw.events : [];
+      for (const rawEvent of rawEvents) {
+        const event = InputEvent.fromJSON(rawEvent);
+        if (event) this.actionAddEvent(raw.name, event);
+      }
+    }
+  }
+
+  /**
+   * 从 URL 载入映射表（浏览器环境下使用 `fetch`）。
+   * 需要在游戏启动早期调用，例如 `await InputMap.singleton.loadFromFile("resources/inputmap.json")`。
+   */
+  async loadFromFile(url: string): Promise<void> {
+    if (typeof fetch !== "function") {
+      console.warn("[InputMap] 当前环境不支持 fetch，无法从文件载入输入映射");
+      return;
+    }
+    const response = await fetch(url);
+    if (!response.ok) {
+      console.warn(`[InputMap] 载入输入映射失败：${url} (${response.status})`);
+      return;
+    }
+    this.loadFromJSON(await response.json());
+  }
+}

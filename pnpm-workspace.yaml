@@ -1,0 +1,4 @@
+minimumReleaseAgeExclude:
+  - '@rslib/core@1.0.1'
+  - rsbuild-plugin-dts@1.0.1
+  - laya-input@0.0.2
