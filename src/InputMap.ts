@@ -25,9 +25,19 @@ export const DEFAULT_DEADZONE = 0.2;
 /** 输入映射编辑器默认写入的资源路径。 */
 export const DEFAULT_INPUT_MAP_PATH = "resources/inputmap.json";
 
+function sanitizeDeadzone(deadzone: number): number {
+  if (!Number.isFinite(deadzone)) return DEFAULT_DEADZONE;
+  return Math.min(Math.max(deadzone, 0), 1);
+}
+
+function sanitizeStrength(strength: number): number {
+  if (!Number.isFinite(strength)) return 0;
+  return Math.min(Math.max(strength, 0), 1);
+}
+
 /** 动作匹配的结果，等价于 Godot 的 `InputMap.event_get_action_status()` 返回值。 */
 export interface ActionStatus {
-  /** 是否命中该动作。 */
+  /** 事件是否命中该动作；释放事件命中时也为 true。 */
   active: boolean;
   /** 是否处于按下状态。 */
   pressed: boolean;
@@ -39,10 +49,11 @@ export interface ActionStatus {
 
 /** 把原始强度按死区归一化，等价于 Godot 的强度换算。 */
 export function normalizeStrength(rawStrength: number, deadzone: number): number {
-  if (rawStrength <= 0) return 0;
+  if (!Number.isFinite(rawStrength) || rawStrength <= 0) return 0;
+  deadzone = sanitizeDeadzone(deadzone);
   if (rawStrength < deadzone) return 0;
   if (deadzone >= 1) return 0;
-  return (rawStrength - deadzone) / (1 - deadzone);
+  return Math.min((rawStrength - deadzone) / (1 - deadzone), 1);
 }
 
 /** 输入映射表。等价于 Godot 的 `InputMap` 单例（autoload）。 */
@@ -58,6 +69,7 @@ export class InputMap {
   private _actions: Map<string, InputMapAction> = new Map();
   /** 由代码强制设置的动作状态（`Input.actionPress` / `Input.setAxis`）。 */
   private _forced: Map<string, { pressed: boolean; strength: number }> = new Map();
+  private _revision = 0;
   private _defaultLoadStarted = false;
   private _defaultLoadPromise: Promise<void> | null = null;
 
@@ -65,6 +77,15 @@ export class InputMap {
   static get singleton(): InputMap {
     if (!InputMap._singleton) InputMap._singleton = new InputMap();
     return InputMap._singleton;
+  }
+
+  /** 每次映射或强制状态发生变化时递增，供运行时缓存失效使用。 */
+  get revision(): number {
+    return this._revision;
+  }
+
+  private _touch(): void {
+    this._revision++;
   }
 
   /**
@@ -83,19 +104,34 @@ export class InputMap {
 
     this._defaultLoadStarted = true;
     const url = InputMap.defaultFile;
-    this._defaultLoadPromise = Promise.resolve(loader.load(url, engine.Loader?.JSON ?? "json"))
+    const startRevision = this._revision;
+    let loaded = false;
+    const loadPromise = Promise.resolve()
+      .then(() => loader.load(url, engine.Loader?.JSON ?? "json"))
       .then((resource: any) => {
         const data = resource && typeof resource === "object" && "data" in resource ? resource.data : resource;
         if (!data) {
-          console.warn(`[InputMap] 载入输入映射失败：${url}`);
+          throw new Error("资源为空");
+        }
+        if (this._revision !== startRevision && this._actions.size > 0) {
+          loaded = true;
+          console.warn(`[InputMap] 默认映射载入完成前映射已被修改，已忽略：${url}`);
           return;
         }
         this.loadFromJSON(typeof data === "string" ? JSON.parse(data) : data);
+        loaded = true;
       })
       .catch((error: unknown) => {
         console.warn(`[InputMap] 载入输入映射失败：${url}`, error);
+      })
+      .finally(() => {
+        if (!loaded) {
+          this._defaultLoadStarted = false;
+          this._defaultLoadPromise = null;
+        }
       });
-    return this._defaultLoadPromise;
+    this._defaultLoadPromise = loadPromise;
+    return loadPromise;
   }
 
   /** 确保默认映射已开始载入，并等待其完成。 */
@@ -123,18 +159,23 @@ export class InputMap {
    */
   addAction(action: string, deadzone: number = DEFAULT_DEADZONE): void {
     if (!action) return;
+    deadzone = sanitizeDeadzone(deadzone);
     const existing = this._actions.get(action);
     if (existing) {
+      if (existing.deadzone === deadzone) return;
       existing.deadzone = deadzone;
+      this._touch();
       return;
     }
     this._actions.set(action, { name: action, deadzone, events: [] });
+    this._touch();
   }
 
   /** 删除动作。等价于 `InputMap.erase_action()`。 */
   eraseAction(action: string): void {
-    this._actions.delete(action);
-    this._forced.delete(action);
+    const actionDeleted = this._actions.delete(action);
+    const forcedDeleted = this._forced.delete(action);
+    if (actionDeleted || forcedDeleted) this._touch();
   }
 
   /** 重命名动作，同时保留原有绑定。 */
@@ -144,19 +185,31 @@ export class InputMap {
     this._actions.delete(action);
     data.name = newName;
     this._actions.set(newName, data);
+    const forced = this._forced.get(action);
+    if (forced) {
+      this._forced.delete(action);
+      this._forced.set(newName, forced);
+    }
+    this._touch();
     return true;
   }
 
   /** 删除全部动作。 */
   clear(): void {
+    if (this._actions.size === 0 && this._forced.size === 0) return;
     this._actions.clear();
     this._forced.clear();
+    this._touch();
   }
 
   /** 设置动作死区。等价于 `InputMap.action_set_deadzone()`。 */
   actionSetDeadzone(action: string, deadzone: number): void {
     const data = this._actions.get(action);
-    if (data) data.deadzone = deadzone;
+    const value = sanitizeDeadzone(deadzone);
+    if (data && data.deadzone !== value) {
+      data.deadzone = value;
+      this._touch();
+    }
   }
 
   /** 读取动作死区。等价于 `InputMap.action_get_deadzone()`。 */
@@ -173,6 +226,7 @@ export class InputMap {
   actionAddEvent(action: string, event: InputEvent): void {
     if (!this.hasAction(action)) this.addAction(action);
     this._actions.get(action)!.events.push(event);
+    this._touch();
   }
 
   /** 动作是否已绑定该事件（全字段比较）。等价于 `InputMap.action_has_event()`。 */
@@ -187,13 +241,19 @@ export class InputMap {
     const data = this._actions.get(action);
     if (!data) return;
     const index = data.events.findIndex((e) => e.isMatch(event));
-    if (index >= 0) data.events.splice(index, 1);
+    if (index >= 0) {
+      data.events.splice(index, 1);
+      this._touch();
+    }
   }
 
   /** 移除动作上的全部绑定事件。等价于 `InputMap.action_erase_events()`。 */
   actionEraseEvents(action: string): void {
     const data = this._actions.get(action);
-    if (data) data.events.length = 0;
+    if (data && data.events.length > 0) {
+      data.events.length = 0;
+      this._touch();
+    }
   }
 
   /** 读取动作绑定的全部事件。等价于 `InputMap.action_get_events()`。 */
@@ -223,28 +283,29 @@ export class InputMap {
     // 1) InputEventAction 直接命中动作名。
     if (event instanceof InputEventAction) {
       if (event.action !== action) return empty;
-      const strength = event.strength === 0 ? 1 : event.strength;
+      const rawStrength = event.isPressed() ? sanitizeStrength(event.strength === 0 ? 1 : event.strength) : 0;
       return {
         active: true,
         pressed: event.isPressed(),
-        strength: Math.min(Math.max(strength, 0), 1),
-        rawStrength: strength,
+        strength: rawStrength,
+        rawStrength,
       };
     }
 
     // 2) 依次尝试动作上绑定的每个事件。
     let pressed = false;
     let rawStrength = 0;
+    let matched = false;
     const out: ActionMatchResult = { pressed: false, strength: 0 };
     for (const rule of data.events) {
       out.pressed = false;
       out.strength = 0;
       if (!rule.actionMatch(event, out, data.deadzone, exactMatch)) continue;
-      if (exactMatch && !rule.isMatch(event)) continue;
+      matched = true;
       pressed = pressed || out.pressed;
       rawStrength = Math.max(rawStrength, out.strength);
     }
-    if (!pressed && rawStrength === 0) return empty;
+    if (!matched) return empty;
 
     return {
       active: true,
@@ -261,7 +322,11 @@ export class InputMap {
   /** 由 `Input.actionPress()` 写入。 */
   setForcedAction(action: string, pressed: boolean, strength: number = 1): void {
     if (!this.hasAction(action)) this.addAction(action);
-    this._forced.set(action, { pressed, strength: pressed ? strength : 0 });
+    const value = { pressed, strength: pressed ? sanitizeStrength(strength) : 0 };
+    const previous = this._forced.get(action);
+    if (previous && previous.pressed === value.pressed && previous.strength === value.strength) return;
+    this._forced.set(action, value);
+    this._touch();
   }
 
   /** 读取强制动作状态，不存在时返回 null。 */
@@ -272,7 +337,9 @@ export class InputMap {
 
   /** 清空所有强制状态（抬起全部虚拟动作）。 */
   clearForcedActions(): void {
+    if (this._forced.size === 0) return;
     this._forced.clear();
+    this._touch();
   }
 
   /* ------------------------------------------------------------------ */

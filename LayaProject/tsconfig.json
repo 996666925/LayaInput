@@ -1,7 +1,7 @@
 {
   "compilerOptions": {
-    "module": "es6",
-    "target": "es6",
+    "module": "es2022",
+    "target": "es2022",
     "strict": true,
     "strictNullChecks": false,
     "noEmitHelpers": true,

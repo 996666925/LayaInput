@@ -39,6 +39,7 @@ import {
 import {
   ActionMatchResult,
   InputEvent,
+  InputEventAction,
   InputEventJoypadButton,
   InputEventJoypadMotion,
   InputEventKey,
@@ -49,11 +50,11 @@ import {
   Quat,
   Vec2,
   Vec3,
-  quat,
   vec2,
   vec3,
 } from "./InputEvent";
 import { InputMap, normalizeStrength } from "./InputMap";
+import { deviceSensors } from "./internal/DeviceSensors";
 
 /** Web Gamepad 标准布局的按键索引 -> Godot `JoyButton`。 */
 const GAMEPAD_BUTTON_MAP: Readonly<Record<number, JoyButton>> = {
@@ -118,6 +119,8 @@ export class Input {
   private static _pressedKeys: Set<Key> = new Set();
   /** 物理键按下集合（对应 `KeyboardEvent.code`）。 */
   private static _pressedPhysicalKeys: Set<Key> = new Set();
+  /** 按键标签集合，供只配置了 `keyLabel` 的映射使用。 */
+  private static _pressedKeyLabels: Set<Key> = new Set();
   /** 鼠标按键按下集合。 */
   private static _pressedMouseButtons: Set<MouseButton> = new Set();
   private static _mouseButtonMask = 0;
@@ -130,6 +133,8 @@ export class Input {
 
   /** 当前帧快照：处于按下状态的动作。 */
   private static _actionStates: Map<string, { pressed: boolean; strength: number; rawStrength: number }> = new Map();
+  /** 最近一次同步到动作快照的 InputMap 版本。 */
+  private static _inputMapRevision = -1;
 
   /** 上一帧用来判断“是否进入了新的一帧”的引擎时间戳。 */
   private static _lastTickStamp = -1;
@@ -150,9 +155,13 @@ export class Input {
   private static _carryUp: Set<string> = new Set();
   private static _readDown: Set<string> = new Set();
   private static _readUp: Set<string> = new Set();
+  private static _freshExactDown: Set<string> = new Set();
+  private static _freshExactUp: Set<string> = new Set();
+  private static _carryExactDown: Set<string> = new Set();
+  private static _carryExactUp: Set<string> = new Set();
+  private static _readExactDown: Set<string> = new Set();
+  private static _readExactUp: Set<string> = new Set();
 
-  /** 自上次 `flushBufferedEvents()` 以来收到的事件。 */
-  private static _bufferedEvents: InputEvent[] = [];
   private static _useAccumulatedInput = true;
 
   private static _mouseMode: MouseMode = MouseMode.VISIBLE;
@@ -169,17 +178,15 @@ export class Input {
   private static _ignoringJoypad = false;
   private static _ignoreJoypadOnUnfocused = true;
   private static _joypads: Map<number, JoypadState> = new Map();
+  /** 由 `parseInputEvent()` 注入、独立于浏览器 Gamepad 快照的手柄状态。 */
+  private static _injectedJoyButtons: Map<number, Set<JoyButton>> = new Map();
+  private static _injectedJoyAxes: Map<number, Map<JoyAxis, number>> = new Map();
   private static _joyConnectionListeners: JoyConnectionChangedCallback[] = [];
   /** 手柄震动状态：设备 -> { 弱马达, 强马达, 时长(ms), 结束时间(ms) }。 */
   private static _joyVibrations: Map<number, { weak: number; strong: number; duration: number; endTime: number }> =
     new Map();
   /** SDL 风格的手柄映射字符串（浏览器无法应用，仅做记录，便于接口对齐）。 */
   private static _joyMappings: Map<string, string> = new Map();
-
-  private static _gesture = { gravity: vec3(), accelerometer: vec3(), magnetometer: vec3(), gyroscope: vec3() };
-  private static _deviceMotionBound = false;
-  private static _deviceOrientation: Quat = quat();
-  private static _deviceOrientationBound = false;
 
   private static _imeText = "";
 
@@ -326,6 +333,7 @@ export class Input {
     Input._keyboardListenersReady = false;
 
     Input._unregisterFrameLoop();
+    deviceSensors.unbind();
     Input._installed = false;
     Input.releaseAllInputs();
   }
@@ -409,10 +417,11 @@ export class Input {
    */
   static isActionPressed(action: string, exactMatch: boolean = false, allowEcho: boolean = false): boolean {
     Input.install();
+    Input._syncInputMap();
     Input._warnIfActionMissing(action);
+    if (exactMatch) return Input._evaluateAction(action, true).pressed;
     const state = Input._actionStates.get(action);
     if (!state) return false;
-    void exactMatch;
     void allowEcho;
     return state.pressed;
   }
@@ -431,16 +440,18 @@ export class Input {
   static isActionJustPressed(action: string, exactMatch: boolean = false): boolean {
     Input._prepareEdgeQuery();
     Input._warnIfActionMissing(action);
-    void exactMatch;
-    return Input._readEdge(action, Input._freshDown, Input._carryDown, Input._readDown);
+    return exactMatch
+      ? Input._readEdge(action, Input._freshExactDown, Input._carryExactDown, Input._readExactDown)
+      : Input._readEdge(action, Input._freshDown, Input._carryDown, Input._readDown);
   }
 
   /** 动作是否在本帧刚被抬起。等价于 `Input.is_action_just_released()`，语义同 `isActionJustPressed()`。 */
   static isActionJustReleased(action: string, exactMatch: boolean = false): boolean {
     Input._prepareEdgeQuery();
     Input._warnIfActionMissing(action);
-    void exactMatch;
-    return Input._readEdge(action, Input._freshUp, Input._carryUp, Input._readUp);
+    return exactMatch
+      ? Input._readEdge(action, Input._freshExactUp, Input._carryExactUp, Input._readExactUp)
+      : Input._readEdge(action, Input._freshUp, Input._carryUp, Input._readUp);
   }
 
   /**
@@ -453,6 +464,7 @@ export class Input {
   private static _prepareEdgeQuery(): void {
     Input.install();
     Input._syncFrame();
+    Input._syncInputMap();
   }
 
   /** 指定事件是否会让动作“刚被按下”。等价于 `Input.is_action_just_pressed_by_event()`。 */
@@ -470,20 +482,22 @@ export class Input {
   /** 动作强度（已应用死区并归一化，0 ~ 1）。等价于 `Input.get_action_strength()`。 */
   static getActionStrength(action: string, exactMatch: boolean = false): number {
     Input.install();
+    Input._syncInputMap();
     Input._warnIfActionMissing(action);
+    if (exactMatch) return Input._evaluateAction(action, true).strength;
     const state = Input._actionStates.get(action);
     if (!state) return 0;
-    void exactMatch;
     return state.strength;
   }
 
   /** 动作原始强度（未归一化）。等价于 `Input.get_action_raw_strength()`。 */
   static getActionRawStrength(action: string, exactMatch: boolean = false): number {
     Input.install();
+    Input._syncInputMap();
     Input._warnIfActionMissing(action);
+    if (exactMatch) return Input._evaluateAction(action, true).rawStrength;
     const state = Input._actionStates.get(action);
     if (!state) return 0;
-    void exactMatch;
     return state.rawStrength;
   }
 
@@ -513,7 +527,7 @@ export class Input {
 
   /**
    * 二维向量。等价于 `Input.get_vector()`。
-   * @param deadzone 传入负数（默认）时自动取四个动作死区的最大值。
+   * @param deadzone 传入负数（默认）时自动取四个动作死区的平均值。
    */
   static getVector(
     negativeX: string,
@@ -523,22 +537,30 @@ export class Input {
     deadzone: number = -1
   ): Vec2 {
     Input.install();
-    const x = Input.getActionRawStrength(positiveX) - Input.getActionRawStrength(negativeX);
-    const y = Input.getActionRawStrength(positiveY) - Input.getActionRawStrength(negativeY);
+    let x = Input.getActionRawStrength(positiveX) - Input.getActionRawStrength(negativeX);
+    let y = Input.getActionRawStrength(positiveY) - Input.getActionRawStrength(negativeY);
     let length = Math.sqrt(x * x + y * y);
     if (length <= 0) return vec2();
 
-    const map = InputMap.singleton;
-    const dz =
-      deadzone < 0
-        ? Math.max(
-            Math.max(map.actionGetDeadzone(negativeX), map.actionGetDeadzone(positiveX)),
-            Math.max(map.actionGetDeadzone(negativeY), map.actionGetDeadzone(positiveY))
-          )
-        : deadzone;
+    if (length > 1) {
+      x /= length;
+      y /= length;
+      length = 1;
+    }
 
-    if (length < dz) return vec2();
-    const newLength = Math.max((length - dz) / (1 - dz), 0);
+    const map = InputMap.singleton;
+    const useDefaultDeadzone = !Number.isFinite(deadzone) || deadzone < 0;
+    const dz =
+      useDefaultDeadzone
+        ? (map.actionGetDeadzone(negativeX) +
+            map.actionGetDeadzone(positiveX) +
+            map.actionGetDeadzone(negativeY) +
+            map.actionGetDeadzone(positiveY)) /
+          4
+        : Math.min(Math.max(deadzone, 0), 1);
+
+    if (length <= dz || dz >= 1) return vec2();
+    const newLength = Math.min(Math.max((length - dz) / (1 - dz), 0), 1);
     const scale = newLength / length;
     return vec2(x * scale, y * scale);
   }
@@ -549,6 +571,7 @@ export class Input {
     InputMap.singleton.setForcedAction(action, true, strength);
     // 立即结算，让 isActionPressed / isActionJustPressed 在同一个调用栈内就是一致的。
     Input._recordActionState(action, Input._evaluateAction(action));
+    Input._inputMapRevision = InputMap.singleton.revision;
   }
 
   /** 强制抬起某个动作。等价于 `Input.action_release()`。 */
@@ -556,6 +579,7 @@ export class Input {
     Input.install();
     InputMap.singleton.setForcedAction(action, false, 0);
     Input._recordActionState(action, Input._evaluateAction(action));
+    Input._inputMapRevision = InputMap.singleton.revision;
   }
 
   /** 用代码设置一维轴值。等价于 `Input.set_axis()`。 */
@@ -577,8 +601,11 @@ export class Input {
   static releaseAllInputs(): void {
     Input._pressedKeys.clear();
     Input._pressedPhysicalKeys.clear();
+    Input._pressedKeyLabels.clear();
     Input._pressedMouseButtons.clear();
     Input._mouseButtonMask = 0;
+    Input._injectedJoyButtons.clear();
+    Input._injectedJoyAxes.clear();
     InputMap.singleton.clearForcedActions();
     for (const joypad of Input._joypads.values()) {
       joypad.buttons.fill(false);
@@ -587,6 +614,7 @@ export class Input {
     Input._actionStates.clear();
     Input._clearEdges();
     Input._warnedMissingActions.clear();
+    Input._inputMapRevision = InputMap.singleton.revision;
   }
 
   /* ------------------------------------------------------------------ */
@@ -611,8 +639,10 @@ export class Input {
    */
   static isAnythingPressed(): boolean {
     Input.install();
+    Input._syncInputMap();
     if (Input._pressedKeys.size > 0) return true;
     if (Input._pressedPhysicalKeys.size > 0) return true;
+    if (Input._pressedKeyLabels.size > 0) return true;
     if (Input._pressedMouseButtons.size > 0) return true;
 
     for (const joypad of Input._joypads.values()) {
@@ -621,6 +651,14 @@ export class Input {
         if (pressed) return true;
       }
       for (const value of joypad.axes) {
+        if (Math.abs(value) > 0.5) return true;
+      }
+    }
+    for (const buttons of Input._injectedJoyButtons.values()) {
+      if (buttons.size > 0) return true;
+    }
+    for (const axes of Input._injectedJoyAxes.values()) {
+      for (const value of axes.values()) {
         if (Math.abs(value) > 0.5) return true;
       }
     }
@@ -784,13 +822,72 @@ export class Input {
    */
   static parseInputEvent(event: InputEvent): void {
     if (!event) return;
-    if (Input._useAccumulatedInput) Input._bufferedEvents.push(event);
-    Input._applyEvent(event);
+    Input.install();
+    Input._syncInputMap();
+    Input._dispatchInputEvent(event, true);
   }
 
-  /** 清空事件缓冲。等价于 `Input.flush_buffered_events()`。 */
+  /** 派发事件；引擎监听器已经更新过底层状态时可跳过重复写入。 */
+  private static _dispatchInputEvent(event: InputEvent, updateState: boolean): void {
+    if (
+      Input._ignoringJoypad &&
+      (event instanceof InputEventJoypadButton || event instanceof InputEventJoypadMotion)
+    ) {
+      return;
+    }
+    if (updateState) Input._applyInjectedEventState(event);
+    Input._applyEvent(event);
+    Input._inputMapRevision = InputMap.singleton.revision;
+  }
+
+  private static _applyInjectedEventState(event: InputEvent): void {
+    if (event instanceof InputEventKey) {
+      if (event.isPressed()) {
+        if (event.keycode !== Key.NONE) Input._pressedKeys.add(event.keycode);
+        if (event.physicalKeycode !== Key.NONE) Input._pressedPhysicalKeys.add(event.physicalKeycode);
+        if (event.keyLabel !== Key.NONE) Input._pressedKeyLabels.add(event.keyLabel);
+      } else {
+        if (event.keycode !== Key.NONE) Input._pressedKeys.delete(event.keycode);
+        if (event.physicalKeycode !== Key.NONE) Input._pressedPhysicalKeys.delete(event.physicalKeycode);
+        if (event.keyLabel !== Key.NONE) Input._pressedKeyLabels.delete(event.keyLabel);
+      }
+      return;
+    }
+    if (event instanceof InputEventMouseButton) {
+      if (event.buttonIndex === MouseButton.NONE) return;
+      if (event.isPressed()) {
+        Input._pressedMouseButtons.add(event.buttonIndex);
+        Input._mouseButtonMask |= Input._toButtonMask(event.buttonIndex);
+      } else {
+        Input._pressedMouseButtons.delete(event.buttonIndex);
+        Input._mouseButtonMask &= ~Input._toButtonMask(event.buttonIndex);
+      }
+      return;
+    }
+    if (event instanceof InputEventJoypadButton) {
+      const buttons = Input._injectedJoyButtons.get(event.device) ?? new Set<JoyButton>();
+      if (event.isPressed()) buttons.add(event.buttonIndex);
+      else buttons.delete(event.buttonIndex);
+      if (buttons.size > 0) Input._injectedJoyButtons.set(event.device, buttons);
+      else Input._injectedJoyButtons.delete(event.device);
+      return;
+    }
+    if (event instanceof InputEventJoypadMotion) {
+      const axes = Input._injectedJoyAxes.get(event.device) ?? new Map<JoyAxis, number>();
+      if (event.axisValue === 0) axes.delete(event.axis);
+      else axes.set(event.axis, event.axisValue);
+      if (axes.size > 0) Input._injectedJoyAxes.set(event.device, axes);
+      else Input._injectedJoyAxes.delete(event.device);
+      return;
+    }
+    if (event instanceof InputEventAction && event.action) {
+      InputMap.singleton.setForcedAction(event.action, event.isPressed(), event.strength);
+    }
+  }
+
+  /** 兼容 Godot API；本实现会即时处理事件，因此没有待清空的事件队列。 */
   static flushBufferedEvents(): void {
-    Input._bufferedEvents.length = 0;
+    // 事件在 parseInputEvent() 中即时生效。
   }
 
   /** 是否使用累积输入。等价于 `Input.is_using_accumulated_input()`。 */
@@ -801,7 +898,6 @@ export class Input {
   /** 设置是否使用累积输入。 */
   static setUseAccumulatedInput(enable: boolean): void {
     Input._useAccumulatedInput = enable;
-    if (!enable) Input.flushBufferedEvents();
   }
 
   /* ------------------------------------------------------------------ */
@@ -844,13 +940,22 @@ export class Input {
   /** 手柄按键是否按下。等价于 `Input.is_joy_button_pressed()`。 */
   static isJoyButtonPressed(device: number, button: JoyButton): boolean {
     Input.install();
-    return Input._joypads.get(device)?.buttons[button] ?? false;
+    if (Input._ignoringJoypad) return false;
+    const joypad = Input._joypads.get(device);
+    return (
+      (joypad?.connected === true && joypad.buttons[button] === true) ||
+      Input._injectedJoyButtons.get(device)?.has(button) === true
+    );
   }
 
   /** 手柄轴值。等价于 `Input.get_joy_axis()`。 */
   static getJoyAxis(device: number, axis: JoyAxis): number {
     Input.install();
-    return Input._joypads.get(device)?.axes[axis] ?? 0;
+    if (Input._ignoringJoypad) return 0;
+    const injected = Input._injectedJoyAxes.get(device)?.get(axis);
+    if (injected !== undefined) return injected;
+    const joypad = Input._joypads.get(device);
+    return joypad?.connected === true ? (joypad.axes[axis] ?? 0) : 0;
   }
 
   /** 轴名 -> `JoyAxis`。等价于 `Input.get_joy_axis_index_from_string()`。 */
@@ -1008,7 +1113,12 @@ export class Input {
 
   /** 设置是否忽略手柄输入。 */
   static setIgnoringJoypad(enable: boolean): void {
+    if (Input._ignoringJoypad === enable) return;
     Input._ignoringJoypad = enable;
+    if (enable) {
+      Input._clearJoypadInputState();
+      Input._evaluateActions();
+    }
   }
 
   /** 窗口失焦时是否忽略手柄（Godot 4.3+ 的 `ignore_joypad_on_unfocused`）。 */
@@ -1038,60 +1148,52 @@ export class Input {
 
   /** 重力向量（m/s²）。等价于 `Input.get_gravity()`。 */
   static getGravity(): Vec3 {
-    Input._bindDeviceMotion();
-    return vec3(Input._gesture.gravity.x, Input._gesture.gravity.y, Input._gesture.gravity.z);
+    return deviceSensors.getGravity();
   }
 
   /** 加速度计向量。等价于 `Input.get_accelerometer()`。 */
   static getAccelerometer(): Vec3 {
-    Input._bindDeviceMotion();
-    return vec3(Input._gesture.accelerometer.x, Input._gesture.accelerometer.y, Input._gesture.accelerometer.z);
+    return deviceSensors.getAccelerometer();
   }
 
   /** 磁力计向量。等价于 `Input.get_magnetometer()`。 */
   static getMagnetometer(): Vec3 {
-    return vec3(Input._gesture.magnetometer.x, Input._gesture.magnetometer.y, Input._gesture.magnetometer.z);
+    return deviceSensors.getMagnetometer();
   }
 
   /** 陀螺仪向量。等价于 `Input.get_gyroscope()`。 */
   static getGyroscope(): Vec3 {
-    return vec3(Input._gesture.gyroscope.x, Input._gesture.gyroscope.y, Input._gesture.gyroscope.z);
+    return deviceSensors.getGyroscope();
   }
 
   /** 设备朝向四元数。等价于 `Input.get_device_orientation()`。 */
   static getDeviceOrientation(): Quat {
-    Input._bindDeviceOrientation();
-    return quat(
-      Input._deviceOrientation.x,
-      Input._deviceOrientation.y,
-      Input._deviceOrientation.z,
-      Input._deviceOrientation.w
-    );
+    return deviceSensors.getOrientation();
   }
 
   /** 覆盖设备朝向（例如自己接入了原生传感器）。等价于 `Input.set_device_orientation()`。 */
   static setDeviceOrientation(orientation: Quat): void {
-    Input._deviceOrientation = quat(orientation.x, orientation.y, orientation.z, orientation.w);
+    deviceSensors.setOrientation(orientation);
   }
 
   /** 覆盖重力向量。等价于 `Input.set_gravity()`。 */
   static setGravity(value: Vec3): void {
-    Input._gesture.gravity = vec3(value.x, value.y, value.z);
+    deviceSensors.setGravity(value);
   }
 
   /** 覆盖加速度计向量。等价于 `Input.set_accelerometer()`。 */
   static setAccelerometer(value: Vec3): void {
-    Input._gesture.accelerometer = vec3(value.x, value.y, value.z);
+    deviceSensors.setAccelerometer(value);
   }
 
   /** 覆盖陀螺仪向量。等价于 `Input.set_gyroscope()`。 */
   static setGyroscope(value: Vec3): void {
-    Input._gesture.gyroscope = vec3(value.x, value.y, value.z);
+    deviceSensors.setGyroscope(value);
   }
 
   /** 覆盖磁力计向量。等价于 `Input.set_magnetometer()`。 */
   static setMagnetometer(value: Vec3): void {
-    Input._gesture.magnetometer = vec3(value.x, value.y, value.z);
+    deviceSensors.setMagnetometer(value);
   }
 
   /* ---- 浏览器无法实现的手柄硬件接口（保留同名方法以便移植代码可编译运行） ---- */
@@ -1348,7 +1450,7 @@ export class Input {
     event.shiftPressed = e.shiftKey;
     event.ctrlPressed = e.ctrlKey;
     event.metaPressed = e.metaKey;
-    Input.parseInputEvent(event);
+    Input._dispatchInputEvent(event, true);
   }
 
   private static _handleKeyUp(e: any, useLogicalAsPhysicalFallback: boolean = false): void {
@@ -1368,7 +1470,7 @@ export class Input {
     event.shiftPressed = e.shiftKey;
     event.ctrlPressed = e.ctrlKey;
     event.metaPressed = e.metaKey;
-    Input.parseInputEvent(event);
+    Input._dispatchInputEvent(event, true);
   }
 
   /** 窗口失焦时释放全部输入，避免“按键卡住”。 */
@@ -1395,7 +1497,7 @@ export class Input {
     event.metaPressed = e.metaKey;
     event.buttonMask = Input._mouseButtonMask;
     Input._mousePosition = vec2(e.stageX, e.stageY);
-    Input.parseInputEvent(event);
+    Input._dispatchInputEvent(event, true);
 
     Input._emitTouchFromMouse(true, event.position);
   }
@@ -1418,7 +1520,7 @@ export class Input {
     event.metaPressed = e.metaKey;
     event.buttonMask = Input._mouseButtonMask;
     Input._mousePosition = vec2(e.stageX, e.stageY);
-    Input.parseInputEvent(event);
+    Input._dispatchInputEvent(event, true);
 
     Input._emitTouchFromMouse(false, event.position);
   }
@@ -1451,9 +1553,11 @@ export class Input {
     event.shiftPressed = e.shiftKey;
     event.ctrlPressed = e.ctrlKey;
     event.metaPressed = e.metaKey;
-    Input.parseInputEvent(event);
+    Input._dispatchInputEvent(event, false);
 
-    Input._emitTouchFromMouse(true, position, relative, true);
+    if (Input._pressedMouseButtons.has(MouseButton.LEFT)) {
+      Input._emitTouchFromMouse(true, position, relative, true);
+    }
   }
 
   /** 滚轮。 */
@@ -1469,7 +1573,7 @@ export class Input {
     down.factor = Math.abs(delta) || 1;
     down.position = vec2(e.stageX, e.stageY);
     down.globalPosition = down.position;
-    Input.parseInputEvent(down);
+    Input._dispatchInputEvent(down, true);
 
     const up = new InputEventMouseButton();
     up.buttonIndex = button;
@@ -1477,7 +1581,7 @@ export class Input {
     up.factor = down.factor;
     up.position = down.position;
     up.globalPosition = down.position;
-    Input.parseInputEvent(up);
+    Input._dispatchInputEvent(up, true);
   }
 
   /** 把鼠标事件模拟为触摸事件。 */
@@ -1489,14 +1593,14 @@ export class Input {
       drag.position = vec2(position.x, position.y);
       drag.relative = relative ? vec2(relative.x, relative.y) : vec2();
       drag.velocity = vec2(Input._mouseVelocity.x, Input._mouseVelocity.y);
-      Input.parseInputEvent(drag);
+      Input._dispatchInputEvent(drag, false);
       return;
     }
     const touch = new InputEventScreenTouch();
     touch.index = 0;
     touch.pressed = pressed;
     touch.position = vec2(position.x, position.y);
-    Input.parseInputEvent(touch);
+    Input._dispatchInputEvent(touch, false);
   }
 
   /** Laya 的 `Event.button` -> Godot `MouseButton`。 */
@@ -1541,18 +1645,23 @@ export class Input {
     for (const action of map.getActions()) {
       const status = map.eventGetActionStatus(event, action, false);
       if (status.active) {
-        // 明确的按下事件（以及代码注入的 InputEventAction）：直接采用事件给出的状态。
-        Input._recordActionState(action, {
-          pressed: status.pressed,
-          strength: status.strength,
-          rawStrength: status.rawStrength,
-        });
+        const previousPressed = Input._actionStates.get(action)?.pressed ?? false;
+        // 释放一个绑定时需要重新评估其他绑定，避免动作仍由另一个按键按住却被误报为释放。
+        const result = status.pressed
+          ? { pressed: true, strength: status.strength, rawStrength: status.rawStrength }
+          : Input._evaluateAction(action);
+        Input._recordActionState(action, result, false);
+
+        const exactStatus = map.eventGetActionStatus(event, action, true);
+        if (exactStatus.active && result.pressed !== previousPressed) {
+          if (result.pressed) Input._freshExactDown.add(action);
+          else Input._freshExactUp.add(action);
+        }
         continue;
       }
 
-      // 抬起事件不会被 `eventGetActionStatus()` 判为 active，
-      // 这里再用绑定关系判断一次，并以“所有绑定当前的真实状态”为准：
-      // 动作绑定了多个按键时，松开其中一个不会误报 just_released。
+      // 摇杆回到零位时方向和强度都不再匹配，但它仍然触及了同一条轴绑定。
+      // 此时以所有绑定的当前真实状态为准重新计算动作。
       if (!Input._eventTouchesAction(event, action)) continue;
       Input._recordActionState(action, Input._evaluateAction(action));
     }
@@ -1564,6 +1673,9 @@ export class Input {
     const deadzone = map.actionGetDeadzone(action);
     const out: ActionMatchResult = { pressed: false, strength: 0 };
     for (const rule of map.actionGetEvents(action)) {
+      if (rule instanceof InputEventJoypadMotion && event instanceof InputEventJoypadMotion) {
+        if (rule.axis === event.axis && (rule.device < 0 || rule.device === event.device)) return true;
+      }
       out.pressed = false;
       out.strength = 0;
       if (rule.actionMatch(event, out, deadzone, false)) return true;
@@ -1579,13 +1691,19 @@ export class Input {
    */
   private static _recordActionState(
     action: string,
-    result: { pressed: boolean; strength: number; rawStrength: number }
+    result: { pressed: boolean; strength: number; rawStrength: number },
+    recordExactEdge: boolean = true
   ): void {
     const previous = Input._actionStates.get(action);
     const wasPressed = !!previous && previous.pressed;
 
-    if (result.pressed && !wasPressed) Input._freshDown.add(action);
-    else if (!result.pressed && wasPressed) Input._freshUp.add(action);
+    if (result.pressed && !wasPressed) {
+      Input._freshDown.add(action);
+      if (recordExactEdge) Input._freshExactDown.add(action);
+    } else if (!result.pressed && wasPressed) {
+      Input._freshUp.add(action);
+      if (recordExactEdge) Input._freshExactUp.add(action);
+    }
 
     Input._actionStates.set(action, result);
   }
@@ -1593,9 +1711,37 @@ export class Input {
   /** 每帧重新评估全部动作（覆盖手柄轴这类“没有明显边沿”的输入）。 */
   private static _evaluateActions(): void {
     const map = InputMap.singleton;
-    for (const action of map.getActions()) {
+    const actions = map.getActions();
+    const activeActions = new Set(actions);
+    for (const action of Input._actionStates.keys()) {
+      if (!activeActions.has(action)) Input._removeActionState(action);
+    }
+    Input._inputMapRevision = map.revision;
+    for (const action of actions) {
       Input._recordActionState(action, Input._evaluateAction(action));
     }
+  }
+
+  /** 映射发生增删改后，让运行时快照立即跟上。 */
+  private static _syncInputMap(): void {
+    if (Input._inputMapRevision === InputMap.singleton.revision) return;
+    Input._evaluateActions();
+  }
+
+  private static _removeActionState(action: string): void {
+    Input._actionStates.delete(action);
+    Input._freshDown.delete(action);
+    Input._freshUp.delete(action);
+    Input._carryDown.delete(action);
+    Input._carryUp.delete(action);
+    Input._readDown.delete(action);
+    Input._readUp.delete(action);
+    Input._freshExactDown.delete(action);
+    Input._freshExactUp.delete(action);
+    Input._carryExactDown.delete(action);
+    Input._carryExactUp.delete(action);
+    Input._readExactDown.delete(action);
+    Input._readExactUp.delete(action);
   }
 
   /**
@@ -1656,10 +1802,16 @@ export class Input {
   private static _advanceFrame(): void {
     Input._readDown.clear();
     Input._readUp.clear();
+    Input._readExactDown.clear();
+    Input._readExactUp.clear();
     Input._carryDown = Input._freshDown;
     Input._carryUp = Input._freshUp;
+    Input._carryExactDown = Input._freshExactDown;
+    Input._carryExactUp = Input._freshExactUp;
     Input._freshDown = new Set();
     Input._freshUp = new Set();
+    Input._freshExactDown = new Set();
+    Input._freshExactUp = new Set();
   }
 
   /** 清空全部边沿标记。 */
@@ -1670,10 +1822,19 @@ export class Input {
     Input._carryUp.clear();
     Input._readDown.clear();
     Input._readUp.clear();
+    Input._freshExactDown.clear();
+    Input._freshExactUp.clear();
+    Input._carryExactDown.clear();
+    Input._carryExactUp.clear();
+    Input._readExactDown.clear();
+    Input._readExactUp.clear();
   }
 
   /** 评估单个动作当前状态。 */
-  private static _evaluateAction(action: string): { pressed: boolean; strength: number; rawStrength: number } {
+  private static _evaluateAction(
+    action: string,
+    exactMatch: boolean = false
+  ): { pressed: boolean; strength: number; rawStrength: number } {
     const map = InputMap.singleton;
     const deadzone = map.actionGetDeadzone(action);
 
@@ -1688,7 +1849,7 @@ export class Input {
     let pressed = false;
     let rawStrength = 0;
     for (const rule of map.actionGetEvents(action)) {
-      const value = Input._evaluateRule(rule, deadzone);
+      const value = Input._evaluateRule(rule, deadzone, exactMatch);
       if (value === null) continue;
       if (value > 0) pressed = true;
       rawStrength = Math.max(rawStrength, value);
@@ -1708,38 +1869,78 @@ export class Input {
    * 把一条绑定规则与当前输入状态比对。
    * @returns 命中时返回强度（>0 表示按下），未命中返回 `null`。
    */
-  private static _evaluateRule(rule: InputEvent, deadzone: number): number | null {
+  private static _evaluateRule(rule: InputEvent, deadzone: number, exactMatch: boolean = false): number | null {
     if (rule instanceof InputEventKey) {
+      if (!Input._modifiersMatchCurrentState(rule, exactMatch)) return null;
       const hit =
         (rule.keycode !== Key.NONE && Input._pressedKeys.has(rule.keycode)) ||
-        (rule.physicalKeycode !== Key.NONE && Input._pressedPhysicalKeys.has(rule.physicalKeycode));
+        (rule.physicalKeycode !== Key.NONE && Input._pressedPhysicalKeys.has(rule.physicalKeycode)) ||
+        (rule.keyLabel !== Key.NONE && Input._pressedKeyLabels.has(rule.keyLabel));
       return hit ? 1 : null;
     }
     if (rule instanceof InputEventMouseButton) {
+      if (!Input._modifiersMatchCurrentState(rule, exactMatch)) return null;
       return Input._pressedMouseButtons.has(rule.buttonIndex) ? 1 : null;
     }
     if (rule instanceof InputEventJoypadButton) {
-      const device = rule.device >= 0 ? rule.device : Input._firstConnectedDevice();
-      if (device < 0) return null;
-      return Input.isJoyButtonPressed(device, rule.buttonIndex) ? 1 : null;
+      if (Input._ignoringJoypad) return null;
+      if (rule.device >= 0) {
+        const joypad = Input._joypads.get(rule.device);
+        if (joypad?.connected && joypad.buttons[rule.buttonIndex] === true) return 1;
+        return Input._injectedJoyButtons.get(rule.device)?.has(rule.buttonIndex) ? 1 : null;
+      }
+      for (const joypad of Input._joypads.values()) {
+        if (joypad.connected && joypad.buttons[rule.buttonIndex] === true) return 1;
+      }
+      for (const buttons of Input._injectedJoyButtons.values()) {
+        if (buttons.has(rule.buttonIndex)) return 1;
+      }
+      return null;
     }
     if (rule instanceof InputEventJoypadMotion) {
-      const device = rule.device >= 0 ? rule.device : Input._firstConnectedDevice();
-      if (device < 0) return null;
-      const value = Input.getJoyAxis(device, rule.axis);
-      if (Math.sign(value) !== Math.sign(rule.axisValue)) return null;
-      const magnitude = Math.abs(value);
-      return magnitude >= deadzone ? magnitude : null;
+      if (Input._ignoringJoypad) return null;
+      let strongest: number | null = null;
+      for (const joypad of Input._joypads.values()) {
+        if (!joypad.connected || (rule.device >= 0 && joypad.index !== rule.device)) continue;
+        const value = joypad.axes[rule.axis] ?? 0;
+        if (Math.sign(value) !== Math.sign(rule.axisValue)) continue;
+        const magnitude = Math.abs(value);
+        if (magnitude >= deadzone && (strongest === null || magnitude > strongest)) strongest = magnitude;
+      }
+      for (const [device, axes] of Input._injectedJoyAxes) {
+        if (rule.device >= 0 && device !== rule.device) continue;
+        const value = axes.get(rule.axis) ?? 0;
+        if (Math.sign(value) !== Math.sign(rule.axisValue)) continue;
+        const magnitude = Math.abs(value);
+        if (magnitude >= deadzone && (strongest === null || magnitude > strongest)) strongest = magnitude;
+      }
+      return strongest;
     }
     return null;
   }
 
-  /** 第一个已连接的手柄设备 ID，没有则返回 -1。 */
-  private static _firstConnectedDevice(): number {
-    for (const joypad of Input._joypads.values()) {
-      if (joypad.connected) return joypad.index;
+  private static _modifiersMatchCurrentState(
+    rule: { altPressed: boolean; shiftPressed: boolean; ctrlPressed: boolean; metaPressed: boolean },
+    exactMatch: boolean
+  ): boolean {
+    const alt = Input._pressedKeys.has(Key.ALT) || Input._pressedPhysicalKeys.has(Key.ALT);
+    const shift = Input._pressedKeys.has(Key.SHIFT) || Input._pressedPhysicalKeys.has(Key.SHIFT);
+    const ctrl = Input._pressedKeys.has(Key.CTRL) || Input._pressedPhysicalKeys.has(Key.CTRL);
+    const meta = Input._pressedKeys.has(Key.META) || Input._pressedPhysicalKeys.has(Key.META);
+    if (exactMatch) {
+      return (
+        rule.altPressed === alt &&
+        rule.shiftPressed === shift &&
+        rule.ctrlPressed === ctrl &&
+        rule.metaPressed === meta
+      );
     }
-    return -1;
+    return (
+      (!rule.altPressed || alt) &&
+      (!rule.shiftPressed || shift) &&
+      (!rule.ctrlPressed || ctrl) &&
+      (!rule.metaPressed || meta)
+    );
   }
 
   /** 单调时钟（毫秒）。 */
@@ -1754,6 +1955,7 @@ export class Input {
     if (!nav || typeof nav.getGamepads !== "function") return;
     if (Input._ignoringJoypad) return;
     if (Input._ignoreJoypadOnUnfocused && typeof document !== "undefined" && document.hasFocus && !document.hasFocus()) {
+      Input._clearJoypadInputState();
       return;
     }
 
@@ -1767,6 +1969,10 @@ export class Input {
       if (!raw) {
         if (state && state.connected) {
           state.connected = false;
+          state.prevButtons = state.buttons.slice();
+          state.prevAxes = state.axes.slice();
+          state.buttons.fill(false);
+          state.axes.fill(0);
           Input._notifyJoyConnection(i, false);
         }
         continue;
@@ -1796,33 +2002,39 @@ export class Input {
       for (let b = 0; b < raw.buttons.length; b++) {
         const mapped = GAMEPAD_BUTTON_MAP[b] ?? joyButtonFromGamepadIndex(b);
         if (mapped === undefined || mapped === JoyButton.MAX || mapped < 0) continue;
-        nextButtons[mapped] = raw.buttons[b].pressed || raw.buttons[b].value > 0.5;
+        const rawButton = raw.buttons[b];
+        if (rawButton) nextButtons[mapped] = rawButton.pressed || rawButton.value > 0.5;
       }
 
       if (raw.axes.length >= 4) {
         for (let a = 0; a < 4; a++) {
           const mapped = joyAxisFromGamepadIndex(a);
           if (mapped < 0) continue;
-          nextAxes[mapped] = Input._applyAxisDeadzone(raw.axes[a]);
+          nextAxes[mapped] = Input._applyAxisDeadzone(raw.axes[a] ?? 0);
         }
       }
-      if (raw.axes.length >= 6) {
-        // 扳机：浏览器是 0 ~ 1，Godot 是 -1 ~ 1。
-        nextAxes[JoyAxis.TRIGGER_LEFT] = raw.axes[6] * 2 - 1;
+      const leftTrigger = raw.buttons[6];
+      if (leftTrigger) {
+        // 标准 Gamepad 把扳机放在 buttons[6/7]，Godot 则把它们暴露为 -1 ~ 1 的轴。
+        nextAxes[JoyAxis.TRIGGER_LEFT] = Math.min(Math.max(leftTrigger.value, 0), 1) * 2 - 1;
       }
-      if (raw.axes.length >= 7) {
-        nextAxes[JoyAxis.TRIGGER_RIGHT] = raw.axes[7] * 2 - 1;
+      const rightTrigger = raw.buttons[7];
+      if (rightTrigger) {
+        nextAxes[JoyAxis.TRIGGER_RIGHT] = Math.min(Math.max(rightTrigger.value, 0), 1) * 2 - 1;
       }
 
       // 先记下边沿，再落地新状态，最后派发事件：
       // `_applyEvent()` 会同步重新评估动作，必须读到最新的按键 / 轴数据。
       const buttonEdges: Array<{ index: JoyButton; pressed: boolean }> = [];
       for (let b = 0; b < JoyButton.MAX; b++) {
-        if (nextButtons[b] !== joypad.buttons[b]) buttonEdges.push({ index: b as JoyButton, pressed: nextButtons[b] });
+        const nextPressed = nextButtons[b] ?? false;
+        if (nextPressed !== (joypad.buttons[b] ?? false)) {
+          buttonEdges.push({ index: b as JoyButton, pressed: nextPressed });
+        }
       }
       const axisEdges: JoyAxis[] = [];
       for (let a = 0; a < JoyAxis.MAX; a++) {
-        if (Math.abs(nextAxes[a] - joypad.axes[a]) >= 0.01) axisEdges.push(a as JoyAxis);
+        if (Math.abs((nextAxes[a] ?? 0) - (joypad.axes[a] ?? 0)) >= 0.01) axisEdges.push(a as JoyAxis);
       }
 
       joypad.prevButtons = joypad.buttons.slice();
@@ -1836,16 +2048,28 @@ export class Input {
         event.buttonIndex = edge.index;
         event.pressed = edge.pressed;
         event.pressure = edge.pressed ? 1 : 0;
-        Input.parseInputEvent(event);
+        Input._dispatchInputEvent(event, false);
       }
       for (const axis of axisEdges) {
         const event = new InputEventJoypadMotion();
         event.device = i;
         event.axis = axis;
-        event.axisValue = nextAxes[axis];
-        Input.parseInputEvent(event);
+        event.axisValue = nextAxes[axis] ?? 0;
+        Input._dispatchInputEvent(event, false);
       }
     }
+  }
+
+  /** 清空手柄输入快照但保留连接信息，重新启用后由下一次轮询恢复。 */
+  private static _clearJoypadInputState(): void {
+    for (const joypad of Input._joypads.values()) {
+      joypad.prevButtons = joypad.buttons.slice();
+      joypad.prevAxes = joypad.axes.slice();
+      joypad.buttons.fill(false);
+      joypad.axes.fill(0);
+    }
+    Input._injectedJoyButtons.clear();
+    Input._injectedJoyAxes.clear();
   }
 
   /** 摇杆的硬件死区，避免回中漂移。 */
@@ -1874,66 +2098,4 @@ export class Input {
     return pads ? pads[device] : null;
   }
 
-  /** 绑定设备朝向传感器，把 alpha/beta/gamma 转成四元数。 */
-  private static _bindDeviceOrientation(): void {
-    if (Input._deviceOrientationBound) return;
-    const win: any = typeof window !== "undefined" ? window : null;
-    if (!win || typeof win.addEventListener !== "function") return;
-    Input._deviceOrientationBound = true;
-    win.addEventListener("deviceorientation", (e: any) => {
-      const alpha = ((e.alpha || 0) * Math.PI) / 180;
-      const beta = ((e.beta || 0) * Math.PI) / 180;
-      const gamma = ((e.gamma || 0) * Math.PI) / 180;
-
-      // 设备朝向采用 ZXY 内旋顺序，与 Godot 的 Quaternion.from_euler 一致。
-      const cx = Math.cos(beta / 2);
-      const sx = Math.sin(beta / 2);
-      const cy = Math.cos(gamma / 2);
-      const sy = Math.sin(gamma / 2);
-      const cz = Math.cos(alpha / 2);
-      const sz = Math.sin(alpha / 2);
-
-      Input._deviceOrientation = quat(
-        sx * cy * cz + cx * sy * sz,
-        cx * sy * cz - sx * cy * sz,
-        cx * cy * sz - sx * sy * cz,
-        cx * cy * cz + sx * sy * sz
-      );
-    }, false);
-  }
-
-  /** 绑定设备运动传感器。 */
-  private static _bindDeviceMotion(): void {
-    if (Input._deviceMotionBound) return;
-    const win: any = typeof window !== "undefined" ? window : null;
-    if (!win || typeof win.addEventListener !== "function") return;
-    Input._deviceMotionBound = true;
-    win.addEventListener("devicemotion", (e: any) => {
-      const gravity = e.accelerationIncludingGravity;
-      if (gravity) {
-        // 浏览器给的是 m/s²，且 y 轴方向与 Godot 相反。
-        Input._gesture.gravity = vec3(
-          gravity.x ? -gravity.x : 0,
-          gravity.y ? -gravity.y : 0,
-          gravity.z ? -gravity.z : 0
-        );
-      }
-      const accel = e.acceleration;
-      if (accel) {
-        Input._gesture.accelerometer = vec3(
-          accel.x ? -accel.x : 0,
-          accel.y ? -accel.y : 0,
-          accel.z ? -accel.z : 0
-        );
-      }
-      const rotation = e.rotationRate;
-      if (rotation) {
-        Input._gesture.gyroscope = vec3(
-          rotation.alpha ? -rotation.alpha * 0.01 : 0,
-          rotation.beta ? -rotation.beta * 0.01 : 0,
-          rotation.gamma ? -rotation.gamma * 0.01 : 0
-        );
-      }
-    }, false);
-  }
 }

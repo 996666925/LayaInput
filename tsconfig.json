@@ -19,6 +19,9 @@
     "resolveJsonModule": true,
     "allowImportingTsExtensions": true,
     /* type checking */
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true
   },

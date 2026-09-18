@@ -102,8 +102,8 @@ export abstract class InputEvent {
   abstract actionMatch(event: InputEvent, out: ActionMatchResult, deadzone: number, exactMatch?: boolean): boolean;
 
   /**
-   * 全字段严格比较，等价于 Godot 的 `InputEvent::is_match()`。
-   * 仅在 `exact_match = true` 时使用。
+   * 比较两条事件的映射配置，等价于 Godot 的 `InputEvent::is_match()`。
+   * `pressed` / `echo` 等瞬时运行时状态不参与比较。
    */
   isMatch(event: InputEvent): boolean {
     return this === event;
@@ -150,6 +150,28 @@ function keyIdentityMatch(rule: InputEventKey, event: InputEventKey): boolean {
   if (rule.physicalKeycode !== Key.NONE && event.physicalKeycode === rule.physicalKeycode) return true;
   if (rule.keyLabel !== Key.NONE && event.keyLabel === rule.keyLabel) return true;
   return false;
+}
+
+/** 映射中声明的修饰键必须存在；精确匹配时也不允许额外修饰键。 */
+function modifiersMatch(
+  rule: { altPressed: boolean; shiftPressed: boolean; ctrlPressed: boolean; metaPressed: boolean },
+  event: { altPressed: boolean; shiftPressed: boolean; ctrlPressed: boolean; metaPressed: boolean },
+  exactMatch: boolean
+): boolean {
+  if (exactMatch) {
+    return (
+      rule.altPressed === event.altPressed &&
+      rule.shiftPressed === event.shiftPressed &&
+      rule.ctrlPressed === event.ctrlPressed &&
+      rule.metaPressed === event.metaPressed
+    );
+  }
+  return (
+    (!rule.altPressed || event.altPressed) &&
+    (!rule.shiftPressed || event.shiftPressed) &&
+    (!rule.ctrlPressed || event.ctrlPressed) &&
+    (!rule.metaPressed || event.metaPressed)
+  );
 }
 
 /**
@@ -210,10 +232,12 @@ export class InputEventKey extends InputEvent {
     return `<${this._pressed ? " pressed" : " released"}> ${name}`;
   }
 
-  actionMatch(event: InputEvent, out: ActionMatchResult, _deadzone: number): boolean {
+  actionMatch(event: InputEvent, out: ActionMatchResult, _deadzone: number, exactMatch = false): boolean {
     const other = event as InputEventKey;
     if (!(other instanceof InputEventKey)) return false;
     if (!keyIdentityMatch(this, other)) return false;
+    if (this.device >= 0 && this.device !== other.device) return false;
+    if (!modifiersMatch(this, other, exactMatch)) return false;
     out.pressed = other.isPressed();
     out.strength = out.pressed ? 1 : 0;
     return true;
@@ -226,8 +250,6 @@ export class InputEventKey extends InputEvent {
       this.keycode === other.keycode &&
       this.physicalKeycode === other.physicalKeycode &&
       this.keyLabel === other.keyLabel &&
-      this._pressed === other.pressed &&
-      this._echo === other.echo &&
       this.altPressed === other.altPressed &&
       this.shiftPressed === other.shiftPressed &&
       this.ctrlPressed === other.ctrlPressed &&
@@ -302,10 +324,12 @@ export class InputEventMouseButton extends InputEvent {
     return `<${this._pressed ? " pressed" : " released"}> ${mouseButtonToString(this.buttonIndex)}`;
   }
 
-  actionMatch(event: InputEvent, out: ActionMatchResult, _deadzone: number): boolean {
+  actionMatch(event: InputEvent, out: ActionMatchResult, _deadzone: number, exactMatch = false): boolean {
     const other = event as InputEventMouseButton;
     if (!(other instanceof InputEventMouseButton)) return false;
     if (this.buttonIndex !== other.buttonIndex) return false;
+    if (this.device >= 0 && this.device !== other.device) return false;
+    if (!modifiersMatch(this, other, exactMatch)) return false;
     out.pressed = other.isPressed();
     out.strength = out.pressed ? 1 : 0;
     return true;
@@ -314,7 +338,14 @@ export class InputEventMouseButton extends InputEvent {
   isMatch(event: InputEvent): boolean {
     const other = event as InputEventMouseButton;
     if (!(other instanceof InputEventMouseButton)) return false;
-    return this.buttonIndex === other.buttonIndex && this._pressed === other.pressed && this.device === other.device;
+    return (
+      this.buttonIndex === other.buttonIndex &&
+      this.altPressed === other.altPressed &&
+      this.shiftPressed === other.shiftPressed &&
+      this.ctrlPressed === other.ctrlPressed &&
+      this.metaPressed === other.metaPressed &&
+      this.device === other.device
+    );
   }
 
   toJSON(): any {
@@ -322,6 +353,10 @@ export class InputEventMouseButton extends InputEvent {
       type: this.type,
       device: this.device,
       buttonIndex: this.buttonIndex,
+      altPressed: this.altPressed,
+      shiftPressed: this.shiftPressed,
+      ctrlPressed: this.ctrlPressed,
+      metaPressed: this.metaPressed,
     };
   }
 
@@ -329,6 +364,10 @@ export class InputEventMouseButton extends InputEvent {
     const ev = new InputEventMouseButton();
     ev.device = data.device ?? -1;
     ev.buttonIndex = data.buttonIndex ?? MouseButton.NONE;
+    ev.altPressed = !!data.altPressed;
+    ev.shiftPressed = !!data.shiftPressed;
+    ev.ctrlPressed = !!data.ctrlPressed;
+    ev.metaPressed = !!data.metaPressed;
     return ev;
   }
 }
@@ -396,11 +435,11 @@ export class InputEventJoypadButton extends InputEvent {
     return `<${this._pressed ? " pressed" : " released"}> Joypad ${joyButtonToDisplayName(this.buttonIndex)}`;
   }
 
-  actionMatch(event: InputEvent, out: ActionMatchResult, _deadzone: number, exactMatch = false): boolean {
+  actionMatch(event: InputEvent, out: ActionMatchResult, _deadzone: number, _exactMatch = false): boolean {
     const other = event as InputEventJoypadButton;
     if (!(other instanceof InputEventJoypadButton)) return false;
     if (this.buttonIndex !== other.buttonIndex) return false;
-    if (exactMatch && this.device >= 0 && this.device !== other.device) return false;
+    if (this.device >= 0 && this.device !== other.device) return false;
     out.pressed = other.isPressed();
     out.strength = other.pressure > 0 ? other.pressure : out.pressed ? 1 : 0;
     return true;
@@ -409,7 +448,7 @@ export class InputEventJoypadButton extends InputEvent {
   isMatch(event: InputEvent): boolean {
     const other = event as InputEventJoypadButton;
     if (!(other instanceof InputEventJoypadButton)) return false;
-    return this.buttonIndex === other.buttonIndex && this._pressed === other.pressed && this.device === other.device;
+    return this.buttonIndex === other.buttonIndex && this.device === other.device;
   }
 
   toJSON(): any {
@@ -441,13 +480,13 @@ export class InputEventJoypadMotion extends InputEvent {
     return `<Joypad Motion> ${joyAxisToDisplayName(this.axis)} ${this.axisValue.toFixed(2)}`;
   }
 
-  actionMatch(event: InputEvent, out: ActionMatchResult, deadzone: number, exactMatch = false): boolean {
+  actionMatch(event: InputEvent, out: ActionMatchResult, deadzone: number, _exactMatch = false): boolean {
     const other = event as InputEventJoypadMotion;
     if (!(other instanceof InputEventJoypadMotion)) return false;
     if (this.axis !== other.axis) return false;
     if (Math.sign(this.axisValue) !== Math.sign(other.axisValue)) return false;
     if (Math.abs(other.axisValue) < deadzone) return false;
-    if (exactMatch && this.device >= 0 && this.device !== other.device) return false;
+    if (this.device >= 0 && this.device !== other.device) return false;
     out.pressed = true;
     out.strength = Math.abs(other.axisValue);
     return true;
@@ -503,14 +542,14 @@ export class InputEventAction extends InputEvent {
     if (!(other instanceof InputEventAction)) return false;
     if (this.action !== other.action) return false;
     out.pressed = other.isPressed();
-    out.strength = other.strength === 0 ? (out.pressed ? 1 : 0) : other.strength;
+    out.strength = out.pressed ? (other.strength === 0 ? 1 : other.strength) : 0;
     return true;
   }
 
   isMatch(event: InputEvent): boolean {
     const other = event as InputEventAction;
     if (!(other instanceof InputEventAction)) return false;
-    return this.action === other.action && this._pressed === other.pressed && this.strength === other.strength;
+    return this.action === other.action && this.strength === other.strength && this.device === other.device;
   }
 
   toJSON(): any {
@@ -608,12 +647,20 @@ export function createMappingEventFromRuntimeEvent(event: InputEvent): InputEven
     ev.physicalKeycode = event.physicalKeycode;
     ev.keyLabel = event.keyLabel;
     ev.device = event.device;
+    ev.altPressed = event.altPressed;
+    ev.shiftPressed = event.shiftPressed;
+    ev.ctrlPressed = event.ctrlPressed;
+    ev.metaPressed = event.metaPressed;
     return ev;
   }
   if (event instanceof InputEventMouseButton) {
     const ev = new InputEventMouseButton();
     ev.buttonIndex = event.buttonIndex;
     ev.device = event.device;
+    ev.altPressed = event.altPressed;
+    ev.shiftPressed = event.shiftPressed;
+    ev.ctrlPressed = event.ctrlPressed;
+    ev.metaPressed = event.metaPressed;
     return ev;
   }
   if (event instanceof InputEventJoypadButton) {

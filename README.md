@@ -143,7 +143,7 @@ onLateUpdate(): void {
 | `getActionStrength(action, exactMatch?)` | 归一化强度（应用死区），0 ~ 1 |
 | `getActionRawStrength(action, exactMatch?)` | 原始强度（未归一化） |
 | `getAxis(negativeAction, positiveAction)` | 一维轴值 = 正向 − 负向 |
-| `getVector(negativeX, positiveX, negativeY, positiveY, deadzone?)` | 二维向量（`deadzone < 0` 时自动取四个动作死区最大值） |
+| `getVector(negativeX, positiveX, negativeY, positiveY, deadzone?)` | 长度不超过 1 的二维向量（`deadzone < 0` 时取四个动作死区平均值） |
 | `actionPress(action, strength?)` | 用代码强制按下动作 |
 | `actionRelease(action)` | 用代码强制抬起动作 |
 | `setAxis(negativeAction, positiveAction, axisValue)` | 用代码设置一维轴 |
@@ -183,8 +183,8 @@ onLateUpdate(): void {
 | 方法 | 说明 |
 | --- | --- |
 | `parseInputEvent(event)` | 手动派发一个输入事件，使其参与动作匹配 |
-| `flushBufferedEvents()` | 清空事件缓冲 |
-| `isUsingAccumulatedInput()` / `setUseAccumulatedInput(enable)` | 是否累积输入；关闭时会顺带清空缓冲 |
+| `flushBufferedEvents()` | 兼容 Godot API；事件已即时处理，因此无需额外刷新 |
+| `isUsingAccumulatedInput()` / `setUseAccumulatedInput(enable)` | 读取 / 设置兼容标记；不会保留事件对象或产生常驻缓冲 |
 
 ### 手柄（Gamepad）
 
@@ -279,7 +279,7 @@ console.log(map.getActions());
 | `type` | 字段 |
 | --- | --- |
 | `key` | `device`、`keycode`、`physicalKeycode`、`keyLabel`、`altPressed`、`shiftPressed`、`ctrlPressed`、`metaPressed` |
-| `mouse_button` | `device`、`buttonIndex` |
+| `mouse_button` | `device`、`buttonIndex`、`altPressed`、`shiftPressed`、`ctrlPressed`、`metaPressed` |
 | `joypad_button` | `device`、`buttonIndex` |
 | `joypad_motion` | `device`、`axis`、`axisValue`（只取符号，`+1` / `-1`） |
 | `action` | `device`、`action`、`strength` |
@@ -363,6 +363,7 @@ npm run build    # 构建产物到 dist/
 npm run dev      # 监听源码变化并重建
 npm run test     # 运行测试
 npm run test:watch
+npm run typecheck
 ```
 
 构建配置见 `rslib.config.ts`，测试配置见 `rstest.config.ts`，源码入口为 `src/index.ts`：
@@ -374,7 +375,9 @@ src/
 ├── InputMap.ts      # 动作映射表
 ├── InputEvent.ts    # 事件家族与向量结构
 ├── InputEnums.ts    # 枚举与按键 / 手柄映射表
+├── internal/
+│   └── DeviceSensors.ts # 浏览器设备传感器与监听生命周期
 └── LayaAir.d.ts     # Laya 运行时类型声明
 ```
 
-`InputEnums.ts`、`InputEvent.ts`、`InputMap.ts` 不依赖 Laya 运行时与 DOM，可安全地在 IDE 扩展中引用；只有 `Input.ts` 会触碰 `Laya` / `window` / `document`，且全部做了存在性判断。
+`InputEnums.ts`、`InputEvent.ts`、`InputMap.ts` 不依赖 Laya 运行时与 DOM，可安全地在 IDE 扩展中引用；运行时适配集中在 `Input.ts` 与 `internal/DeviceSensors.ts`，对 `Laya` / `window` / `document` 的访问均有环境检查。
